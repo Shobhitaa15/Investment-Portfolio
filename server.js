@@ -12,14 +12,21 @@ const allowedOrigins = (process.env.CORS_ORIGIN || '')
   .map((origin) => normalizeOrigin(origin))
   .filter(Boolean);
 
+const isAllowedOrigin = (origin = '') => {
+  const normalized = normalizeOrigin(origin);
+  if (!normalized) return true;
+  if (allowedOrigins.length === 0) return true;
+  if (allowedOrigins.includes(normalized)) return true;
+  if (normalized.endsWith('.netlify.app')) return true;
+  return false;
+};
+
 app.use(
   cors({
     origin: (origin, callback) => {
-      if (!origin) return callback(null, true);
-      if (allowedOrigins.length === 0) return callback(null, true);
-      if (allowedOrigins.includes(normalizeOrigin(origin))) return callback(null, true);
-      return callback(null, false);
+      return callback(null, isAllowedOrigin(origin));
     },
+    optionsSuccessStatus: 200,
   })
 );
 app.use(express.json());
