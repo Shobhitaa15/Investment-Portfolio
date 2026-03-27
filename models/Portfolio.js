@@ -12,6 +12,10 @@ const holdingSchema = new mongoose.Schema({
   estimatedExitDate: { type: String, default: 'N/A' },
   risk: { type: String, enum: ['low', 'medium', 'high'], default: 'medium' },
   liquidity: { type: String, enum: ['low', 'medium', 'high'], default: 'medium' },
+  fitScore: {
+    score: { type: Number, default: 0 },
+    explanation: { type: String, default: '' },
+  },
 });
 
 const portfolioSchema = new mongoose.Schema({
@@ -24,6 +28,7 @@ const portfolioSchema = new mongoose.Schema({
   },
   totalValue: { type: Number, default: 0 },
   avgReturn: { type: Number, default: 0 },
+  overallFitScore: { type: Number, default: 0 },
 }, { timestamps: true });
 
 module.exports = mongoose.model('Portfolio', portfolioSchema);
