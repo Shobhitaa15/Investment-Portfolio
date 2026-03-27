@@ -20,7 +20,7 @@ const generateEmbedding = (text, dim = 64) => {
   return vector;
 };
 
-const MONGODB_URI = "mongodb://portfolioadmin:admin123@cluster0-shard-00-00.drpla.mongodb.net:27017,cluster0-shard-00-01.drpla.mongodb.net:27017,cluster0-shard-00-02.drpla.mongodb.net:27017/?ssl=true&replicaSet=atlas-138fre-shard-0&authSource=admin&appName=Cluster0";
+const MONGODB_URI = process.env.MONGODB_URI;
 
 const calculateRisk = (returnPercent) => {
   if (Math.abs(returnPercent) > 30) return 'high';
@@ -47,6 +47,10 @@ const loadCSV = (filePath) => {
 
 const loadAllStocks = async () => {
   try {
+    if (!MONGODB_URI) {
+      throw new Error('MONGODB_URI is required to load stock data.');
+    }
+
     console.log('Connecting to MongoDB...');
     await mongoose.connect(MONGODB_URI, { family: 4 });
     console.log('Connected! Loading stock data...');

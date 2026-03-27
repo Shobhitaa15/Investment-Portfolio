@@ -5,6 +5,10 @@ const Stock = require('../models/Stock');
 const Portfolio = require('../models/Portfolio');
 const { calculateFitScore } = require('../config/fitScore');
 
+const OLLAMA_BASE_URL = (process.env.OLLAMA_BASE_URL || 'http://localhost:11434').replace(/\/+$/, '');
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'qwen2.5:3b';
+const OLLAMA_ENABLED = process.env.OLLAMA_ENABLED !== 'false';
+
 const getEmbedding = (text, dim = 64) => {
   const hash = crypto.createHash('sha256').update(text).digest();
   const vector = [];
@@ -28,6 +32,18 @@ const cosineSimilarity = (a = [], b = []) => {
 };
 
 const escapeRegex = (value = '') => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+const buildFallbackMessage = (topStocks = []) => {
+  if (!topStocks.length) {
+    return 'I could not find enough market data right now. Please refresh and try again.';
+  }
+
+  const highlights = topStocks
+    .map((stock) => `${stock.ticker} (${stock.returnPercentage}% return, ${stock.risk} risk)`)
+    .join(', ');
+
+  return `Top matches right now: ${highlights}. Ask me to compare any two for a deeper view.`;
+};
 
 router.get('/markets', async (req, res) => {
   try {
@@ -135,33 +151,46 @@ router.post('/', async (req, res) => {
       `${s.company} (${s.ticker}): Sector=${s.sector}, Return=${s.returnPercentage}%, Risk=${s.risk}, FitScore=${s.fitScore.score}/100, Relevance=${s.combinedScore}/100`
     ).join('\n');
 
-    // Call Ollama
-    const ollamaResponse = await fetch('http://localhost:11434/api/chat', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: 'qwen2.5:3b',
-        messages: [
-          {
-            role: 'system',
-            content: `You are Profitly, an expert AI investment assistant for Indian stock markets. 
+    let aiMessage = buildFallbackMessage(topStocks);
+
+    if (OLLAMA_ENABLED) {
+      try {
+        const ollamaResponse = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: OLLAMA_MODEL,
+            messages: [
+              {
+                role: 'system',
+                content: `You are Profitly, an expert AI investment assistant for Indian stock markets. 
 You have access to real Nifty 50 stock data. Be concise, friendly and professional.
 Always use emojis to make responses engaging. Keep responses under 3 sentences.
 Here are the top matching stocks for this query:
 ${stockContext}`
-          },
-          ...sessionHistory,
-          {
-            role: 'user',
-            content: message
-          }
-        ],
-        stream: false
-      })
-    });
+              },
+              ...sessionHistory,
+              {
+                role: 'user',
+                content: message
+              }
+            ],
+            stream: false
+          })
+        });
 
-    const ollamaData = await ollamaResponse.json();
-    const aiMessage = ollamaData.message?.content || 'Here are your top matches!';
+        if (!ollamaResponse.ok) {
+          throw new Error(`Ollama request failed with status ${ollamaResponse.status}`);
+        }
+
+        const ollamaData = await ollamaResponse.json();
+        if (ollamaData?.message?.content) {
+          aiMessage = ollamaData.message.content;
+        }
+      } catch (ollamaError) {
+        console.warn('Ollama unavailable, using fallback response:', ollamaError.message || ollamaError);
+      }
+    }
 
     res.json({
       message: aiMessage,
