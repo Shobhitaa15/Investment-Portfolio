@@ -5,9 +5,11 @@ const cors = require('cors');
 
 const app = express();
 
+const normalizeOrigin = (value = '') => value.trim().replace(/\/+$/, '').toLowerCase();
+
 const allowedOrigins = (process.env.CORS_ORIGIN || '')
   .split(',')
-  .map((origin) => origin.trim())
+  .map((origin) => normalizeOrigin(origin))
   .filter(Boolean);
 
 app.use(
@@ -15,8 +17,8 @@ app.use(
     origin: (origin, callback) => {
       if (!origin) return callback(null, true);
       if (allowedOrigins.length === 0) return callback(null, true);
-      if (allowedOrigins.includes(origin)) return callback(null, true);
-      return callback(new Error('CORS origin denied'));
+      if (allowedOrigins.includes(normalizeOrigin(origin))) return callback(null, true);
+      return callback(null, false);
     },
   })
 );
