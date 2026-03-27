@@ -3,7 +3,7 @@ const crypto = require('crypto');
 const router = express.Router();
 const Stock = require('../models/Stock');
 const Portfolio = require('../models/Portfolio');
-const { calculateFitScore } = require('../config/fitScore');
+const { calculateFitScore } = require('../config/FitScore');
 
 const OLLAMA_BASE_URL = (process.env.OLLAMA_BASE_URL || 'http://localhost:11434').replace(/\/+$/, '');
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'qwen2.5:3b';
