@@ -1,13 +1,25 @@
 const express = require('express');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+const csv = require('csv-parser');
 const router = express.Router();
 const Stock = require('../models/Stock');
 const Portfolio = require('../models/Portfolio');
 const { calculateFitScore } = require('../config/FitScore');
+const sectorMap = require('../config/sectorMap');
 
 const OLLAMA_BASE_URL = (process.env.OLLAMA_BASE_URL || 'http://localhost:11434').replace(/\/+$/, '');
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'qwen2.5:3b';
 const OLLAMA_ENABLED = process.env.OLLAMA_ENABLED !== 'false';
+const FALLBACK_CACHE_TTL_MS = 5 * 60 * 1000;
+let fallbackMarketsCache = null;
+let fallbackMarketsCacheAt = 0;
+
+const toNumber = (value, fallback = 0) => {
+  const parsed = Number.parseFloat(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+};
 
 const getEmbedding = (text, dim = 64) => {
   const hash = crypto.createHash('sha256').update(text).digest();
@@ -33,6 +45,110 @@ const cosineSimilarity = (a = [], b = []) => {
 
 const escapeRegex = (value = '') => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
+const calculateRisk = (returnPercent) => {
+  if (Math.abs(returnPercent) > 30) return 'high';
+  if (Math.abs(returnPercent) > 15) return 'medium';
+  return 'low';
+};
+
+const calculateLiquidity = (volume) => {
+  if (volume > 10000000) return 'high';
+  if (volume > 1000000) return 'medium';
+  return 'low';
+};
+
+const loadCsvRows = (filePath) => new Promise((resolve, reject) => {
+  const rows = [];
+  fs.createReadStream(filePath)
+    .pipe(csv())
+    .on('data', (row) => rows.push(row))
+    .on('end', () => resolve(rows))
+    .on('error', reject);
+});
+
+const buildFallbackMarkets = async () => {
+  const now = Date.now();
+  if (fallbackMarketsCache && (now - fallbackMarketsCacheAt) < FALLBACK_CACHE_TTL_MS) {
+    return fallbackMarketsCache;
+  }
+
+  const dataDir = path.join(__dirname, '..', 'data');
+  const files = fs.readdirSync(dataDir).filter((file) => file.toLowerCase().endsWith('.csv'));
+  const markets = [];
+
+  for (const file of files) {
+    const ticker = file.replace('.csv', '').replace('.NS', '').toUpperCase();
+    const csvPath = path.join(dataDir, file);
+    const rows = await loadCsvRows(csvPath);
+    if (!rows.length) continue;
+
+    const validRows = rows.filter((row) => row.Close && !Number.isNaN(Number.parseFloat(row.Close)));
+    if (validRows.length < 2) continue;
+
+    const latestRow = validRows[0];
+    const oldestRow = validRows[validRows.length - 1];
+    const latestClose = Number.parseFloat(latestRow.Close);
+    const openPrice = Number.parseFloat(latestRow.Open || 0);
+    const highPrice = Number.parseFloat(latestRow.High || 0);
+    const lowPrice = Number.parseFloat(latestRow.Low || 0);
+    const firstClose = Number.parseFloat(oldestRow.Close);
+    const avgVolume = validRows.reduce((sum, row) => sum + Number.parseFloat(row.Volume || 0), 0) / validRows.length;
+    const returnPercent = firstClose > 0 ? ((latestClose - firstClose) / firstClose) * 100 : 0;
+
+    const sectorInfo = sectorMap[ticker] || { sector: 'Other', fullName: ticker };
+
+    markets.push({
+      ticker,
+      fullName: sectorInfo.fullName,
+      sector: sectorInfo.sector,
+      latestClose: Number(latestClose.toFixed(2)),
+      openPrice: Number(openPrice.toFixed(2)),
+      highPrice: Number(highPrice.toFixed(2)),
+      lowPrice: Number(lowPrice.toFixed(2)),
+      volume: Math.round(avgVolume),
+      returnPercent: Number(returnPercent.toFixed(2)),
+      risk: calculateRisk(returnPercent),
+      liquidity: calculateLiquidity(avgVolume),
+      lastUpdated: new Date(),
+    });
+  }
+
+  fallbackMarketsCache = markets;
+  fallbackMarketsCacheAt = now;
+  return markets;
+};
+
+const buildFallbackStocks = async () => {
+  const fallbackMarkets = await buildFallbackMarkets();
+  return fallbackMarkets.map((stock) => ({
+    ...stock,
+    vector: getEmbedding(`${stock.fullName || stock.ticker} ${stock.sector || ''}`),
+  }));
+};
+
+const fetchPortfolioSafely = async (userId) => {
+  try {
+    return await Portfolio.findOne({ userId }).lean();
+  } catch (portfolioError) {
+    console.warn('Portfolio query failed, continuing without personalization:', portfolioError.message || portfolioError);
+    return null;
+  }
+};
+
+const fetchStocksSafely = async () => {
+  try {
+    const stocks = await Stock.find({}).lean();
+    if (Array.isArray(stocks) && stocks.length > 0) {
+      return { stocks, source: 'mongodb' };
+    }
+  } catch (stocksError) {
+    console.warn('Stocks query failed, switching to CSV fallback:', stocksError.message || stocksError);
+  }
+
+  const fallbackStocks = await buildFallbackStocks();
+  return { stocks: fallbackStocks, source: 'csv-fallback' };
+};
+
 const buildFallbackMessage = (topStocks = []) => {
   if (!topStocks.length) {
     return 'I could not find enough market data right now. Please refresh and try again.';
@@ -52,17 +168,42 @@ router.get('/markets', async (req, res) => {
     const search = (req.query.search || '').trim();
     const sector = (req.query.sector || '').trim();
 
+    const pattern = search ? new RegExp(escapeRegex(search), 'i') : null;
     const query = {};
     if (sector) query.sector = sector;
-    if (search) {
-      const pattern = new RegExp(escapeRegex(search), 'i');
-      query.$or = [{ ticker: pattern }, { fullName: pattern }];
+    if (pattern) query.$or = [{ ticker: pattern }, { fullName: pattern }];
+
+    let stocks = [];
+    let source = 'mongodb';
+
+    try {
+      stocks = await Stock.find(query)
+        .sort({ returnPercent: -1, latestClose: -1 })
+        .limit(limit)
+        .lean();
+    } catch (dbError) {
+      console.warn('Markets DB query failed, switching to CSV fallback:', dbError.message || dbError);
+      source = 'csv-fallback';
     }
 
-    const stocks = await Stock.find(query)
-      .sort({ returnPercent: -1, latestClose: -1 })
-      .limit(limit)
-      .lean();
+    if (!stocks.length) {
+      const fallback = await buildFallbackMarkets();
+      source = 'csv-fallback';
+
+      stocks = fallback
+        .filter((stock) => {
+          if (sector && stock.sector !== sector) return false;
+          if (!pattern) return true;
+          return pattern.test(stock.ticker) || pattern.test(stock.fullName || '');
+        })
+        .sort((a, b) => {
+          if ((b.returnPercent || 0) !== (a.returnPercent || 0)) {
+            return (b.returnPercent || 0) - (a.returnPercent || 0);
+          }
+          return (b.latestClose || 0) - (a.latestClose || 0);
+        })
+        .slice(0, limit);
+    }
 
     const markets = stocks.map((stock) => ({
       ticker: stock.ticker,
@@ -78,7 +219,7 @@ router.get('/markets', async (req, res) => {
       lastUpdated: stock.lastUpdated,
     }));
 
-    res.json({ count: markets.length, markets });
+    res.json({ count: markets.length, markets, source });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -86,18 +227,30 @@ router.get('/markets', async (req, res) => {
 
 router.post('/', async (req, res) => {
   try {
-    const { message, sessionHistory = [], userId = 'demo' } = req.body;
+    const { message = '', sessionHistory = [], userId = 'demo' } = req.body;
+    const normalizedMessage = String(message).trim();
+
+    if (!normalizedMessage) {
+      return res.status(400).json({ error: 'Message is required.' });
+    }
+
+    const normalizedSessionHistory = Array.isArray(sessionHistory)
+      ? sessionHistory
+        .filter((item) => item && (item.role === 'user' || item.role === 'assistant') && typeof item.content === 'string')
+        .slice(-12)
+      : [];
 
     // Fetch user portfolio (for personalization)
-    const portfolio = await Portfolio.findOne({ userId }).lean();
+    const portfolio = await fetchPortfolioSafely(userId);
 
-    // Fetch real stock data from MongoDB
-    const stocks = await Stock.find({}).lean();
+    // Fetch stock data from MongoDB, then fallback to CSV snapshots
+    const { stocks, source: stockSource } = await fetchStocksSafely();
 
     // Build user profile from message context and stored portfolio
-    const riskToleranceFromMsg = message.toLowerCase().includes('low risk') ? 'low' :
-                     message.toLowerCase().includes('high risk') ? 'high' : 'medium';
-    const preferredSectors = extractSectors(message);
+    const lowerMessage = normalizedMessage.toLowerCase();
+    const riskToleranceFromMsg = lowerMessage.includes('low risk') ? 'low' :
+                     lowerMessage.includes('high risk') ? 'high' : 'medium';
+    const preferredSectors = extractSectors(normalizedMessage);
     const avgReturn = portfolio?.avgReturn || 15;
 
     const userProfile = {
@@ -109,32 +262,32 @@ router.post('/', async (req, res) => {
 
     // Compute embedding vector for the user's question (and their portfolio companies) for RAG-style retrieval
     const portfolioText = portfolio?.holdings?.map(h => h.company).join(' ') || '';
-    const queryEmbedding = getEmbedding(`${message} ${portfolioText}`);
+    const queryEmbedding = getEmbedding(`${normalizedMessage} ${portfolioText}`);
 
     // Calculate fit scores and similarity scores
     const scoredStocks = stocks.map(stock => {
       const fitScore = calculateFitScore({
         sector: stock.sector,
-        returnPercentage: stock.returnPercent,
+        returnPercentage: toNumber(stock.returnPercent),
         risk: stock.risk,
         liquidity: stock.liquidity,
-        minInvestment: stock.latestClose
+        minInvestment: toNumber(stock.latestClose)
       }, userProfile);
 
       const similarityScore = Math.round(((cosineSimilarity(queryEmbedding, stock.vector) + 1) / 2) * 100);
       const combinedScore = Math.round(fitScore.score * 0.75 + similarityScore * 0.25);
 
       return {
-        company: stock.fullName,
+        company: stock.fullName || stock.ticker,
         sector: stock.sector,
         stage: 'Listed',
-        minInvestment: Math.round(stock.latestClose),
-        valuation: Math.round(stock.latestClose * stock.volume),
-        returnPercentage: stock.returnPercent,
+        minInvestment: Math.round(toNumber(stock.latestClose)),
+        valuation: Math.round(toNumber(stock.latestClose) * toNumber(stock.volume)),
+        returnPercentage: toNumber(stock.returnPercent),
         risk: stock.risk,
         liquidity: stock.liquidity,
         ticker: stock.ticker,
-        latestClose: stock.latestClose,
+        latestClose: toNumber(stock.latestClose),
         fitScore,
         similarityScore,
         combinedScore
@@ -169,10 +322,10 @@ Always use emojis to make responses engaging. Keep responses under 3 sentences.
 Here are the top matching stocks for this query:
 ${stockContext}`
               },
-              ...sessionHistory,
+              ...normalizedSessionHistory,
               {
                 role: 'user',
-                content: message
+                content: normalizedMessage
               }
             ],
             stream: false
@@ -195,6 +348,7 @@ ${stockContext}`
     res.json({
       message: aiMessage,
       offerings: topStocks,
+      source: stockSource,
       suggestions: [
         "🏦 Show me banking sector stocks",
         "💊 What are healthcare options?",
