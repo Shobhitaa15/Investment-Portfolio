@@ -8,6 +8,14 @@ const Stock = require('../models/Stock');
 const Portfolio = require('../models/Portfolio');
 const { calculateFitScore } = require('../config/FitScore');
 const sectorMap = require('../config/sectorMap');
+const Groq = require('groq-sdk');
+
+const groq = new Groq({
+  apiKey: process.env.GROQ_API_KEY
+});
+
+const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.1-8b-instant';
+const GROQ_ENABLED = !!process.env.GROQ_API_KEY;
 
 const OLLAMA_BASE_URL = (process.env.OLLAMA_BASE_URL || 'http://localhost:11434').replace(/\/+$/, '');
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'qwen2.5:3b';
@@ -130,7 +138,7 @@ const fetchPortfolioSafely = async (userId) => {
   try {
     return await Portfolio.findOne({ userId }).lean();
   } catch (portfolioError) {
-    console.warn('Portfolio query failed, continuing without personalization:', portfolioError.message || portfolioError);
+    console.warn('Portfolio query failed:', portfolioError.message || portfolioError);
     return null;
   }
 };
@@ -142,7 +150,7 @@ const fetchStocksSafely = async () => {
       return { stocks, source: 'mongodb' };
     }
   } catch (stocksError) {
-    console.warn('Stocks query failed, switching to CSV fallback:', stocksError.message || stocksError);
+    console.warn('Stocks query failed:', stocksError.message);
   }
 
   const fallbackStocks = await buildFallbackStocks();
@@ -153,12 +161,33 @@ const buildFallbackMessage = (topStocks = []) => {
   if (!topStocks.length) {
     return 'I could not find enough market data right now. Please refresh and try again.';
   }
-
   const highlights = topStocks
     .map((stock) => `${stock.ticker} (${stock.returnPercentage}% return, ${stock.risk} risk)`)
     .join(', ');
-
   return `Top matches right now: ${highlights}. Ask me to compare any two for a deeper view.`;
+};
+
+const buildSystemPrompt = (portfolioContext, stockContext, normalizedSessionHistory, lastResponseContext) => {
+  return `You are Profitly, an expert AI investment assistant for Indian stock markets (NSE/Nifty 50).
+
+STRICT RULES:
+1. NEVER repeat the same response twice in a conversation
+2. ALWAYS check the conversation history and give NEW information
+3. If you already mentioned a stock, suggest DIFFERENT stocks
+4. Vary your response style — sometimes analytical, sometimes encouraging, sometimes cautionary
+5. Keep responses under 4 sentences with emojis
+6. Always mention specific numbers (prices, returns, scores)
+
+USER PORTFOLIO CONTEXT:
+${portfolioContext}
+
+TOP MATCHING STOCKS FOR THIS QUERY:
+${stockContext}
+
+CONVERSATION SO FAR: ${normalizedSessionHistory.length} messages exchanged.
+${lastResponseContext}
+
+Remember: Every response must add NEW value. Never be repetitive!`;
 };
 
 router.get('/markets', async (req, res) => {
@@ -182,14 +211,13 @@ router.get('/markets', async (req, res) => {
         .limit(limit)
         .lean();
     } catch (dbError) {
-      console.warn('Markets DB query failed, switching to CSV fallback:', dbError.message || dbError);
+      console.warn('Markets DB query failed:', dbError.message || dbError);
       source = 'csv-fallback';
     }
 
     if (!stocks.length) {
       const fallback = await buildFallbackMarkets();
       source = 'csv-fallback';
-
       stocks = fallback
         .filter((stock) => {
           if (sector && stock.sector !== sector) return false;
@@ -240,31 +268,27 @@ router.post('/', async (req, res) => {
         .slice(-12)
       : [];
 
-    // Fetch user portfolio (for personalization)
     const portfolio = await fetchPortfolioSafely(userId);
-
-    // Fetch stock data from MongoDB, then fallback to CSV snapshots
     const { stocks, source: stockSource } = await fetchStocksSafely();
 
-    // Build user profile from message context and stored portfolio
     const lowerMessage = normalizedMessage.toLowerCase();
     const riskToleranceFromMsg = lowerMessage.includes('low risk') ? 'low' :
-                     lowerMessage.includes('high risk') ? 'high' : 'medium';
+      lowerMessage.includes('high risk') ? 'high' : 'medium';
     const preferredSectors = extractSectors(normalizedMessage);
     const avgReturn = portfolio?.avgReturn || 15;
 
     const userProfile = {
       riskTolerance: portfolio?.riskProfile?.tolerance || riskToleranceFromMsg,
-      preferredSectors: portfolio?.holdings?.length ? Array.from(new Set(portfolio.holdings.map(h => h.sector))) : preferredSectors,
+      preferredSectors: portfolio?.holdings?.length
+        ? Array.from(new Set(portfolio.holdings.map(h => h.sector)))
+        : preferredSectors,
       availableCapital: 50000,
       averageReturn: avgReturn
     };
 
-    // Compute embedding vector for the user's question (and their portfolio companies) for RAG-style retrieval
     const portfolioText = portfolio?.holdings?.map(h => h.company).join(' ') || '';
     const queryEmbedding = getEmbedding(`${normalizedMessage} ${portfolioText}`);
 
-    // Calculate fit scores and similarity scores
     const scoredStocks = stocks.map(stock => {
       const fitScore = calculateFitScore({
         sector: stock.sector,
@@ -274,7 +298,9 @@ router.post('/', async (req, res) => {
         minInvestment: toNumber(stock.latestClose)
       }, userProfile);
 
-      const similarityScore = Math.round(((cosineSimilarity(queryEmbedding, stock.vector) + 1) / 2) * 100);
+      const similarityScore = Math.round(
+        ((cosineSimilarity(queryEmbedding, stock.vector || getEmbedding(`${stock.fullName || stock.ticker} ${stock.sector || ''}`)) + 1) / 2) * 100
+      );
       const combinedScore = Math.round(fitScore.score * 0.75 + similarityScore * 0.25);
 
       return {
@@ -294,54 +320,104 @@ router.post('/', async (req, res) => {
       };
     });
 
-    // Sort and get top 3 most relevant stocks (RAG-style)
     const topStocks = scoredStocks
       .sort((a, b) => b.combinedScore - a.combinedScore)
       .slice(0, 3);
 
-    // Build context for Ollama
     const stockContext = topStocks.map(s =>
       `${s.company} (${s.ticker}): Sector=${s.sector}, Return=${s.returnPercentage}%, Risk=${s.risk}, FitScore=${s.fitScore.score}/100, Relevance=${s.combinedScore}/100`
     ).join('\n');
 
+    const portfolioContext = portfolio
+      ? `User holds: ${portfolio.holdings?.map(h => `${h.company} (${h.sector})`).join(', ')}
+Total Portfolio Value: ₹${portfolio.totalValue}
+Average Return: ${portfolio.avgReturn}%`
+      : 'User has not uploaded portfolio yet — encourage them to upload for personalized advice';
+
+    const lastResponseContext = normalizedSessionHistory.length > 0
+      ? `Last assistant response was about: ${normalizedSessionHistory[normalizedSessionHistory.length - 1]?.content?.slice(0, 100)}... — DO NOT repeat this information.`
+      : 'This is the first message — give a warm welcome with top stock picks.';
+
     let aiMessage = buildFallbackMessage(topStocks);
 
-    if (OLLAMA_ENABLED) {
+    const systemPrompt = buildSystemPrompt(portfolioContext, stockContext, normalizedSessionHistory, lastResponseContext);
+
+    // Try Groq first
+    if (GROQ_ENABLED) {
       try {
+        console.log('Using Groq AI...');
+        const groqResponse = await groq.chat.completions.create({
+          model: GROQ_MODEL,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            ...normalizedSessionHistory,
+            { role: 'user', content: normalizedMessage }
+          ],
+          temperature: 0.8,
+          max_tokens: 300,
+        });
+
+        if (groqResponse.choices[0]?.message?.content) {
+          aiMessage = groqResponse.choices[0].message.content;
+          console.log('Groq response received successfully');
+        }
+      } catch (groqError) {
+        console.warn('Groq failed, trying Ollama fallback:', groqError.message);
+
+        // Fallback to Ollama
+        try {
+          const ollamaResponse = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              model: OLLAMA_MODEL,
+              messages: [
+                { role: 'system', content: systemPrompt },
+                ...normalizedSessionHistory,
+                { role: 'user', content: normalizedMessage }
+              ],
+              stream: false
+            })
+          });
+
+          if (ollamaResponse.ok) {
+            const ollamaData = await ollamaResponse.json();
+            if (ollamaData?.message?.content) {
+              aiMessage = ollamaData.message.content;
+              console.log('Ollama fallback response received');
+            }
+          }
+        } catch (ollamaError) {
+          console.warn('Ollama also unavailable:', ollamaError.message);
+        }
+      }
+    } else if (OLLAMA_ENABLED) {
+      // No Groq key — use Ollama directly
+      try {
+        console.log('Using Ollama AI...');
         const ollamaResponse = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             model: OLLAMA_MODEL,
             messages: [
-              {
-                role: 'system',
-                content: `You are Profitly, an expert AI investment assistant for Indian stock markets. 
-You have access to real Nifty 50 stock data. Be concise, friendly and professional.
-Always use emojis to make responses engaging. Keep responses under 3 sentences.
-Here are the top matching stocks for this query:
-${stockContext}`
-              },
+              { role: 'system', content: systemPrompt },
               ...normalizedSessionHistory,
-              {
-                role: 'user',
-                content: normalizedMessage
-              }
+              { role: 'user', content: normalizedMessage }
             ],
             stream: false
           })
         });
 
-        if (!ollamaResponse.ok) {
-          throw new Error(`Ollama request failed with status ${ollamaResponse.status}`);
-        }
-
-        const ollamaData = await ollamaResponse.json();
-        if (ollamaData?.message?.content) {
-          aiMessage = ollamaData.message.content;
+        if (ollamaResponse.ok) {
+          const ollamaData = await ollamaResponse.json();
+          if (ollamaData?.message?.content) {
+            aiMessage = ollamaData.message.content;
+            console.log('Ollama response received successfully');
+          }
         }
       } catch (ollamaError) {
-        console.warn('Ollama unavailable, using fallback response:', ollamaError.message || ollamaError);
+        console.warn('Ollama unavailable:', ollamaError.message);
       }
     }
 
@@ -358,7 +434,7 @@ ${stockContext}`
     });
 
   } catch (error) {
-    console.log('Ollama error:', error.message);
+    console.log('Chat error:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
