@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
+const crypto = require('crypto');
 
 const app = express();
 
@@ -45,6 +46,18 @@ app.get('/', (req, res) => {
 
 const PORT = Number.parseInt(process.env.PORT, 10) || 5000;
 const MONGODB_URI = process.env.MONGODB_URI;
+const isProduction = process.env.NODE_ENV === 'production';
+
+const ensureAuthSecret = () => {
+  if (process.env.AUTH_TOKEN_SECRET) return;
+
+  if (isProduction) {
+    throw new Error('AUTH_TOKEN_SECRET must be set in production');
+  }
+
+  process.env.AUTH_TOKEN_SECRET = crypto.randomBytes(32).toString('hex');
+  console.warn('AUTH_TOKEN_SECRET was missing; generated an in-memory dev secret for this process.');
+};
 
 const startServer = () => {
   app.listen(PORT, () => {
@@ -53,6 +66,8 @@ const startServer = () => {
 };
 
 const start = async () => {
+  ensureAuthSecret();
+
   if (!MONGODB_URI) {
     console.warn('MONGODB_URI is not set. Starting server without MongoDB connection.');
     startServer();

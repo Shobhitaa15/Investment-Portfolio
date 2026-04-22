@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const Portfolio = require('../models/Portfolio');
 const { calculateFitScore } = require('../config/FitScore');
+const requireAuth = require('../middleware/auth');
 
 const VALID_RISK = new Set(['low', 'medium', 'high']);
 const VALID_HORIZON = new Set(['short', 'medium', 'long']);
@@ -69,10 +70,13 @@ const normalizeHolding = (holding = {}) => {
   };
 };
 
+router.use(requireAuth);
+
 // Save portfolio
 router.post('/save', async (req, res) => {
   try {
-    const { userId = 'demo', holdings = [], riskProfile = {} } = req.body;
+    const { holdings = [], riskProfile = {} } = req.body;
+    const userId = req.user?.id;
 
     if (!Array.isArray(holdings) || holdings.length === 0) {
       return res.status(400).json({ error: 'Holdings array is required.' });
@@ -142,7 +146,7 @@ router.post('/save', async (req, res) => {
 // Get portfolio
 router.get('/get', async (req, res) => {
   try {
-    const userId = req.query.userId || 'demo';
+    const userId = req.user?.id;
     const portfolio = await Portfolio.findOne({ userId });
     res.json({ portfolio });
   } catch (error) {

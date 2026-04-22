@@ -8,6 +8,7 @@ const Stock = require('../models/Stock');
 const Portfolio = require('../models/Portfolio');
 const { calculateFitScore } = require('../config/FitScore');
 const sectorMap = require('../config/sectorMap');
+const requireAuth = require('../middleware/auth');
 const Groq = require('groq-sdk');
 
 const groq = new Groq({
@@ -253,9 +254,10 @@ router.get('/markets', async (req, res) => {
   }
 });
 
-router.post('/', async (req, res) => {
+router.post('/', requireAuth, async (req, res) => {
   try {
-    const { message = '', sessionHistory = [], userId = 'demo' } = req.body;
+    const { message = '', sessionHistory = [] } = req.body;
+    const userId = req.user?.id;
     const normalizedMessage = String(message).trim();
 
     if (!normalizedMessage) {

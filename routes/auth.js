@@ -3,12 +3,13 @@ const fs = require('fs');
 const path = require('path');
 const mongoose = require('mongoose');
 const User = require('../models/User');
+const { hashPassword, verifyPassword } = require('../utils/password');
+const { signToken } = require('../utils/token');
 
 const router = express.Router();
 const usersFile = path.join(__dirname, '..', 'data', 'users.json');
 
 const normalizeEmail = (value = '') => String(value).trim().toLowerCase();
-const createToken = (userId) => `${userId}:${Date.now()}`;
 const inDbMode = () => mongoose.connection.readyState === 1;
 
 const readUsers = () => {
@@ -35,6 +36,11 @@ const validateRequired = (name, email, password) => {
   return '';
 };
 
+const buildAuthResponse = ({ id, name, email }) => ({
+  token: signToken({ sub: id }),
+  user: { id, name, email },
+});
+
 router.post('/register', async (req, res) => {
   const { name, email, password } = req.body;
   const normalizedEmail = normalizeEmail(email);
@@ -51,20 +57,19 @@ router.post('/register', async (req, res) => {
         return res.status(400).json({ error: 'User already exists' });
       }
 
+      const passwordHash = await hashPassword(password);
+
       const created = await User.create({
         name: String(name).trim(),
         email: normalizedEmail,
-        password: String(password),
+        password: passwordHash,
       });
 
-      return res.json({
-        token: createToken(created._id.toString()),
-        user: {
-          id: created._id.toString(),
-          name: created.name,
-          email: created.email,
-        },
-      });
+      return res.json(buildAuthResponse({
+        id: created._id.toString(),
+        name: created.name,
+        email: created.email,
+      }));
     } catch (error) {
       if (error && error.code === 11000) {
         return res.status(400).json({ error: 'User already exists' });
@@ -79,19 +84,17 @@ router.post('/register', async (req, res) => {
     return res.status(400).json({ error: 'User already exists' });
   }
 
+  const passwordHash = await hashPassword(password);
   const user = {
     id: Date.now().toString(),
     name: String(name).trim(),
     email: normalizedEmail,
-    password: String(password),
+    password: passwordHash,
   };
   users.push(user);
   writeUsers(users);
 
-  return res.json({
-    token: createToken(user.id),
-    user: { id: user.id, name: user.name, email: user.email },
-  });
+  return res.json(buildAuthResponse({ id: user.id, name: user.name, email: user.email }));
 });
 
 router.post('/login', async (req, res) => {
@@ -106,33 +109,52 @@ router.post('/login', async (req, res) => {
   if (inDbMode()) {
     try {
       const user = await User.findOne({ email: normalizedEmail }).lean();
-      if (!user || user.password !== String(password)) {
+      if (!user) {
         return res.status(400).json({ error: 'Invalid email or password' });
       }
 
-      return res.json({
-        token: createToken(user._id.toString()),
-        user: {
-          id: user._id.toString(),
-          name: user.name,
-          email: user.email,
-        },
-      });
+      const verification = await verifyPassword(password, user.password);
+      if (!verification.isValid) {
+        return res.status(400).json({ error: 'Invalid email or password' });
+      }
+
+      if (verification.needsRehash) {
+        const upgradedHash = await hashPassword(password);
+        try {
+          await User.updateOne({ _id: user._id }, { password: upgradedHash });
+        } catch (rehashError) {
+          console.warn('Could not upgrade DB password hash:', rehashError.message || rehashError);
+        }
+      }
+
+      return res.json(buildAuthResponse({
+        id: user._id.toString(),
+        name: user.name,
+        email: user.email,
+      }));
     } catch (error) {
       console.warn('Login DB error, falling back to file storage:', error.message || error);
     }
   }
 
   const users = readUsers();
-  const user = users.find((entry) => entry.email === normalizedEmail);
-  if (!user || user.password !== String(password)) {
+  const userIndex = users.findIndex((entry) => entry.email === normalizedEmail);
+  if (userIndex < 0) {
     return res.status(400).json({ error: 'Invalid email or password' });
   }
 
-  return res.json({
-    token: createToken(user.id),
-    user: { id: user.id, name: user.name, email: user.email },
-  });
+  const user = users[userIndex];
+  const verification = await verifyPassword(password, user.password);
+  if (!verification.isValid) {
+    return res.status(400).json({ error: 'Invalid email or password' });
+  }
+
+  if (verification.needsRehash) {
+    users[userIndex].password = await hashPassword(password);
+    writeUsers(users);
+  }
+
+  return res.json(buildAuthResponse({ id: user.id, name: user.name, email: user.email }));
 });
 
 module.exports = router;
