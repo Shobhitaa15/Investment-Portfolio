@@ -9,6 +9,7 @@ const Portfolio = require('../models/Portfolio');
 const { calculateFitScore } = require('../config/FitScore');
 const sectorMap = require('../config/sectorMap');
 const requireAuth = require('../middleware/auth');
+const { logActivityEvent } = require('../utils/activityLogger');
 const Groq = require('groq-sdk');
 
 const groq = new Groq({
@@ -248,8 +249,30 @@ router.get('/markets', async (req, res) => {
       lastUpdated: stock.lastUpdated,
     }));
 
+    logActivityEvent({
+      type: 'markets_view',
+      userId: req.user?.id,
+      userEmail: req.user?.email || '',
+      req,
+      statusCode: 200,
+      meta: {
+        count: markets.length,
+        source,
+        search: search ? search.slice(0, 80) : '',
+        sector: sector || '',
+      },
+    });
+
     res.json({ count: markets.length, markets, source });
   } catch (error) {
+    logActivityEvent({
+      type: 'markets_view_failed',
+      userId: req.user?.id,
+      userEmail: req.user?.email || '',
+      req,
+      statusCode: 500,
+      meta: { reason: 'server_error' },
+    });
     res.status(500).json({ error: error.message });
   }
 });
@@ -258,9 +281,18 @@ router.post('/', requireAuth, async (req, res) => {
   try {
     const { message = '', sessionHistory = [] } = req.body;
     const userId = req.user?.id;
+    const userEmail = req.user?.email || '';
     const normalizedMessage = String(message).trim();
 
     if (!normalizedMessage) {
+      logActivityEvent({
+        type: 'chat_message_failed',
+        userId,
+        userEmail,
+        req,
+        statusCode: 400,
+        meta: { reason: 'empty_message' },
+      });
       return res.status(400).json({ error: 'Message is required.' });
     }
 
@@ -423,6 +455,19 @@ Average Return: ${portfolio.avgReturn}%`
       }
     }
 
+    logActivityEvent({
+      type: 'chat_message',
+      userId,
+      userEmail,
+      req,
+      statusCode: 200,
+      meta: {
+        messageLength: normalizedMessage.length,
+        contextMessages: normalizedSessionHistory.length,
+        offeringsCount: topStocks.length,
+      },
+    });
+
     res.json({
       message: aiMessage,
       offerings: topStocks,
@@ -437,6 +482,14 @@ Average Return: ${portfolio.avgReturn}%`
 
   } catch (error) {
     console.log('Chat error:', error.message);
+    logActivityEvent({
+      type: 'chat_message_failed',
+      userId: req.user?.id,
+      userEmail: req.user?.email || '',
+      req,
+      statusCode: 500,
+      meta: { reason: 'server_error' },
+    });
     res.status(500).json({ error: error.message });
   }
 });

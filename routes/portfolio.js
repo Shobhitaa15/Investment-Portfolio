@@ -3,6 +3,7 @@ const router = express.Router();
 const Portfolio = require('../models/Portfolio');
 const { calculateFitScore } = require('../config/FitScore');
 const requireAuth = require('../middleware/auth');
+const { logActivityEvent } = require('../utils/activityLogger');
 
 const VALID_RISK = new Set(['low', 'medium', 'high']);
 const VALID_HORIZON = new Set(['short', 'medium', 'long']);
@@ -77,8 +78,17 @@ router.post('/save', async (req, res) => {
   try {
     const { holdings = [], riskProfile = {} } = req.body;
     const userId = req.user?.id;
+    const userEmail = req.user?.email || '';
 
     if (!Array.isArray(holdings) || holdings.length === 0) {
+      logActivityEvent({
+        type: 'portfolio_save_failed',
+        userId,
+        userEmail,
+        req,
+        statusCode: 400,
+        meta: { reason: 'empty_holdings' },
+      });
       return res.status(400).json({ error: 'Holdings array is required.' });
     }
 
@@ -87,6 +97,14 @@ router.post('/save', async (req, res) => {
       .filter(Boolean);
 
     if (!normalizedHoldings.length) {
+      logActivityEvent({
+        type: 'portfolio_save_failed',
+        userId,
+        userEmail,
+        req,
+        statusCode: 400,
+        meta: { reason: 'invalid_holdings' },
+      });
       return res.status(400).json({ error: 'No valid holdings to score. Include company, sector, entryPrice and currentValue.' });
     }
 
@@ -137,8 +155,29 @@ router.post('/save', async (req, res) => {
       { new: true, upsert: true }
     );
 
+    logActivityEvent({
+      type: 'portfolio_save',
+      userId,
+      userEmail,
+      req,
+      statusCode: 200,
+      meta: {
+        holdingsCount: normalizedHoldings.length,
+        totalValue: Number(totalValue.toFixed(2)),
+        avgReturn,
+      },
+    });
+
     res.json({ success: true, portfolio });
   } catch (error) {
+    logActivityEvent({
+      type: 'portfolio_save_failed',
+      userId: req.user?.id,
+      userEmail: req.user?.email || '',
+      req,
+      statusCode: 500,
+      meta: { reason: 'server_error' },
+    });
     res.status(500).json({ error: error.message });
   }
 });
@@ -147,9 +186,26 @@ router.post('/save', async (req, res) => {
 router.get('/get', async (req, res) => {
   try {
     const userId = req.user?.id;
+    const userEmail = req.user?.email || '';
     const portfolio = await Portfolio.findOne({ userId });
+    logActivityEvent({
+      type: 'portfolio_get',
+      userId,
+      userEmail,
+      req,
+      statusCode: 200,
+      meta: { hasPortfolio: Boolean(portfolio) },
+    });
     res.json({ portfolio });
   } catch (error) {
+    logActivityEvent({
+      type: 'portfolio_get_failed',
+      userId: req.user?.id,
+      userEmail: req.user?.email || '',
+      req,
+      statusCode: 500,
+      meta: { reason: 'server_error' },
+    });
     res.status(500).json({ error: error.message });
   }
 });

@@ -7,7 +7,7 @@ const decode = (value) => JSON.parse(Buffer.from(value, 'base64url').toString('u
 
 const getTokenSecret = () => process.env.AUTH_TOKEN_SECRET || '';
 
-const signToken = ({ sub }) => {
+const signToken = ({ sub, email = '', isAdmin = false }) => {
   const tokenSecret = getTokenSecret();
   if (!tokenSecret) {
     throw new Error('AUTH_TOKEN_SECRET is missing');
@@ -17,6 +17,8 @@ const signToken = ({ sub }) => {
   const ttl = Number.isFinite(ttlRaw) && ttlRaw > 0 ? ttlRaw : DEFAULT_TOKEN_TTL_SECONDS;
   const payload = {
     sub: String(sub),
+    email: String(email || '').trim().toLowerCase(),
+    isAdmin: Boolean(isAdmin),
     iat: Math.floor(Date.now() / 1000),
     exp: Math.floor(Date.now() / 1000) + ttl,
   };

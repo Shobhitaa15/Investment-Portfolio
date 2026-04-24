@@ -40,6 +40,9 @@ app.use('/api/portfolio', portfolioRoute);
 const authRoute = require('./routes/auth');
 app.use('/api/auth', authRoute);
 
+const adminRoute = require('./routes/admin');
+app.use('/api/admin', adminRoute);
+
 app.get('/', (req, res) => {
   res.json({ message: 'Portfolio Assistant API is running!' });
 });

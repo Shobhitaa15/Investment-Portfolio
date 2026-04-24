@@ -5,6 +5,8 @@ const mongoose = require('mongoose');
 const User = require('../models/User');
 const { hashPassword, verifyPassword } = require('../utils/password');
 const { signToken } = require('../utils/token');
+const { isAdminEmail } = require('../utils/admin');
+const { logActivityEvent } = require('../utils/activityLogger');
 
 const router = express.Router();
 const usersFile = path.join(__dirname, '..', 'data', 'users.json');
@@ -36,10 +38,13 @@ const validateRequired = (name, email, password) => {
   return '';
 };
 
-const buildAuthResponse = ({ id, name, email }) => ({
-  token: signToken({ sub: id }),
-  user: { id, name, email },
-});
+const buildAuthResponse = ({ id, name, email }) => {
+  const admin = isAdminEmail(email);
+  return {
+    token: signToken({ sub: id, email, isAdmin: admin }),
+    user: { id, name, email, isAdmin: admin },
+  };
+};
 
 router.post('/register', async (req, res) => {
   const { name, email, password } = req.body;
@@ -65,11 +70,21 @@ router.post('/register', async (req, res) => {
         password: passwordHash,
       });
 
-      return res.json(buildAuthResponse({
+      const response = buildAuthResponse({
         id: created._id.toString(),
         name: created.name,
         email: created.email,
-      }));
+      });
+
+      logActivityEvent({
+        type: 'auth_register',
+        userId: response.user.id,
+        userEmail: response.user.email,
+        req,
+        statusCode: 200,
+      });
+
+      return res.json(response);
     } catch (error) {
       if (error && error.code === 11000) {
         return res.status(400).json({ error: 'User already exists' });
@@ -94,6 +109,14 @@ router.post('/register', async (req, res) => {
   users.push(user);
   writeUsers(users);
 
+  logActivityEvent({
+    type: 'auth_register',
+    userId: user.id,
+    userEmail: user.email,
+    req,
+    statusCode: 200,
+  });
+
   return res.json(buildAuthResponse({ id: user.id, name: user.name, email: user.email }));
 });
 
@@ -110,11 +133,26 @@ router.post('/login', async (req, res) => {
     try {
       const user = await User.findOne({ email: normalizedEmail }).lean();
       if (!user) {
+        logActivityEvent({
+          type: 'auth_login_failed',
+          userEmail: normalizedEmail,
+          req,
+          statusCode: 400,
+          meta: { reason: 'user_not_found' },
+        });
         return res.status(400).json({ error: 'Invalid email or password' });
       }
 
       const verification = await verifyPassword(password, user.password);
       if (!verification.isValid) {
+        logActivityEvent({
+          type: 'auth_login_failed',
+          userId: user._id?.toString(),
+          userEmail: normalizedEmail,
+          req,
+          statusCode: 400,
+          meta: { reason: 'invalid_password' },
+        });
         return res.status(400).json({ error: 'Invalid email or password' });
       }
 
@@ -127,11 +165,21 @@ router.post('/login', async (req, res) => {
         }
       }
 
-      return res.json(buildAuthResponse({
+      const response = buildAuthResponse({
         id: user._id.toString(),
         name: user.name,
         email: user.email,
-      }));
+      });
+
+      logActivityEvent({
+        type: 'auth_login',
+        userId: response.user.id,
+        userEmail: response.user.email,
+        req,
+        statusCode: 200,
+      });
+
+      return res.json(response);
     } catch (error) {
       console.warn('Login DB error, falling back to file storage:', error.message || error);
     }
@@ -140,12 +188,27 @@ router.post('/login', async (req, res) => {
   const users = readUsers();
   const userIndex = users.findIndex((entry) => entry.email === normalizedEmail);
   if (userIndex < 0) {
+    logActivityEvent({
+      type: 'auth_login_failed',
+      userEmail: normalizedEmail,
+      req,
+      statusCode: 400,
+      meta: { reason: 'user_not_found' },
+    });
     return res.status(400).json({ error: 'Invalid email or password' });
   }
 
   const user = users[userIndex];
   const verification = await verifyPassword(password, user.password);
   if (!verification.isValid) {
+    logActivityEvent({
+      type: 'auth_login_failed',
+      userId: user.id,
+      userEmail: normalizedEmail,
+      req,
+      statusCode: 400,
+      meta: { reason: 'invalid_password' },
+    });
     return res.status(400).json({ error: 'Invalid email or password' });
   }
 
@@ -154,7 +217,17 @@ router.post('/login', async (req, res) => {
     writeUsers(users);
   }
 
-  return res.json(buildAuthResponse({ id: user.id, name: user.name, email: user.email }));
+  const response = buildAuthResponse({ id: user.id, name: user.name, email: user.email });
+
+  logActivityEvent({
+    type: 'auth_login',
+    userId: response.user.id,
+    userEmail: response.user.email,
+    req,
+    statusCode: 200,
+  });
+
+  return res.json(response);
 });
 
 module.exports = router;
