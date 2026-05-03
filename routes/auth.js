@@ -15,9 +15,10 @@ const usersFile = path.join(__dirname, '..', 'data', 'users.json');
 const normalizeEmail = (value = '') => String(value).trim().toLowerCase();
 const inDbMode = () => mongoose.connection.readyState === 1;
 const googleTokenInfoUrl = 'https://oauth2.googleapis.com/tokeninfo';
+const defaultGoogleClientId = '954113173254-fr1j4fup20p22qldoth07roh678e9rgq.apps.googleusercontent.com';
 
 const getGoogleClientIds = () =>
-  String(process.env.GOOGLE_CLIENT_IDS || process.env.GOOGLE_CLIENT_ID || process.env.VITE_GOOGLE_CLIENT_ID || '')
+  String(process.env.GOOGLE_CLIENT_IDS || process.env.GOOGLE_CLIENT_ID || process.env.VITE_GOOGLE_CLIENT_ID || defaultGoogleClientId)
     .split(',')
     .map((clientId) => clientId.trim())
     .filter(Boolean);
