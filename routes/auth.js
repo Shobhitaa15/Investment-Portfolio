@@ -22,6 +22,11 @@ const getGoogleClientIds = () =>
     .map((clientId) => clientId.trim())
     .filter(Boolean);
 
+router.get('/config', (req, res) => {
+  const [googleClientId = ''] = getGoogleClientIds();
+  return res.json({ googleClientId });
+});
+
 const readUsers = () => {
   try {
     const raw = fs.readFileSync(usersFile, 'utf8');

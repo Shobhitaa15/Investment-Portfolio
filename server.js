@@ -13,9 +13,15 @@ const allowedOrigins = (process.env.CORS_ORIGIN || '')
   .map((origin) => normalizeOrigin(origin))
   .filter(Boolean);
 
+const localDevOrigins = new Set([
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+]);
+
 const isAllowedOrigin = (origin = '') => {
   const normalized = normalizeOrigin(origin);
   if (!normalized) return true;
+  if (localDevOrigins.has(normalized)) return true;
   if (allowedOrigins.length === 0) return true;
   if (allowedOrigins.includes(normalized)) return true;
   if (normalized.endsWith('.netlify.app')) return true;
