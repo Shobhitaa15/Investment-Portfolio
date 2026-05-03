@@ -18,10 +18,16 @@ const localDevOrigins = new Set([
   'http://127.0.0.1:5173',
 ]);
 
+const productionWebOrigins = new Set([
+  'https://investmentportfolio.netlify.app',
+  'https://investmentportfolioo.netlify.app',
+]);
+
 const isAllowedOrigin = (origin = '') => {
   const normalized = normalizeOrigin(origin);
   if (!normalized) return true;
   if (localDevOrigins.has(normalized)) return true;
+  if (productionWebOrigins.has(normalized)) return true;
   if (allowedOrigins.length === 0) return true;
   if (allowedOrigins.includes(normalized)) return true;
   if (normalized.endsWith('.netlify.app')) return true;
