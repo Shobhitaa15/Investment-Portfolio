@@ -34,6 +34,27 @@ const isAllowedOrigin = (origin = '') => {
   return false;
 };
 
+app.use((req, res, next) => {
+  const origin = req.headers.origin || '';
+  if (isAllowedOrigin(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin || '*');
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+    res.setHeader(
+      'Access-Control-Allow-Headers',
+      req.headers['access-control-request-headers'] || 'Content-Type, Authorization'
+    );
+  } else if (origin) {
+    console.warn(`Blocked CORS origin: ${origin}`);
+  }
+
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
+
+  return next();
+});
+
 app.use(
   cors({
     origin: (origin, callback) => {
